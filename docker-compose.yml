@@ -1,0 +1,87 @@
+version: "3.9"
+services:
+  kafka:
+    image: redpandadata/redpanda:v24.1.3
+    command: [
+      "redpanda", "start",
+      "--overprovisioned", "--smp", "1",
+      "--reserve-memory", "0M",
+      "--node-id", "0",
+      "--kafka-addr", "PLAINTEXT://0.0.0.0:9092",
+      "--advertise-kafka-addr", "PLAINTEXT://kafka:9092"
+    ]
+    ports: ["9092:9092"]
+
+  flink-jobmanager:
+    image: flink:1.18.1-scala_2.12
+    command: jobmanager
+    environment:
+    - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+    ports: ["8081:8081"]
+    depends_on: [kafka]
+
+  flink-taskmanager:
+    image: flink:1.18.1-scala_2.12
+    command: taskmanager
+    environment:
+    - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+    depends_on: [flink-jobmanager]
+
+  generator:
+    build: ./generator
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+    ports:
+      - "8000:8000"
+    depends_on:
+      - kafka
+
+  llm:
+    build: ./llm
+    ports:
+      - "8003:8003"
+    environment:
+      - GOOGLE_API_KEY=AIzaSyDF4Z0pvyfpD3_mUfzaNyJs79rbmivfBAE
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - LLM_MODEL=mock
+    depends_on:
+      - kafka
+
+  retry-overload:
+    build: ./retry
+    command: python retry_overload.py
+    environment:
+    - BOOTSTRAP_SERVERS=kafka:9092
+    depends_on: [kafka]
+
+  retry-quota:
+    build: ./retry
+    command: python retry_quota.py
+    environment:
+    - BOOTSTRAP_SERVERS=kafka:9092
+    depends_on: [kafka]
+
+  storage:
+    build: ./storage
+    environment:
+    - BOOTSTRAP_SERVERS=kafka:9092
+    - DB_URL=sqlite:///data.db
+    - SCORE_THRESHOLD=0.62
+    volumes:
+    - storage_data:/app/data
+    ports: ["8000:8000"]
+    depends_on: [kafka]
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    restart: "no"
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: "kafka:29092"
+      JVM_OPTS: "-Xms16M -Xmx48M -Xss180K -XX:-TieredCompilation -XX:+UseStringDeduplication -noverify"
+    depends_on:
+      - kafka
+
+  volumes:
+    storage_data:
