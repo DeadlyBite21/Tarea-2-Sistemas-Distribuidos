@@ -1,126 +1,186 @@
 import json
 import asyncio
 import logging
-import uuid
 import os
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
-from aiokafka import AIOKafkaProducer
-import random
-import aiohttp
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+import google.generativeai as genai
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("generator")
+logger = logging.getLogger("llm-service")
 
 # =======================
-# Config (vía variables)
+# Configuración por entorno
 # =======================
 BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
-TOPIC_REQUESTS = os.getenv("TOPIC_REQUESTS", "questions.pending")
-STORAGE_SERVICE_URL = os.getenv("STORAGE_SERVICE_URL", "http://storage:8000")
+TOPIC_IN = os.getenv("TOPIC_IN", "questions.pending")
+TOPIC_OK = os.getenv("TOPIC_OK", "answers.success")
+TOPIC_ERR_OVERLOAD = os.getenv("TOPIC_ERR_OVERLOAD", "answers.error.overload")
+TOPIC_ERR_QUOTA = os.getenv("TOPIC_ERR_QUOTA", "answers.error.quota")
 
-# Preguntas de respaldo si falla el storage
-FALLBACK_QUESTIONS: List[str] = [
-    "What is a distributed system?",
-    "Explain at-least-once vs exactly-once semantics.",
-    "How does Kafka ensure durability?",
-    "What is the role of a JobManager in Flink?",
-    "Compare push vs pull-based backpressure.",
-    "What is partitioning and why does it matter in Kafka?",
-]
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # ¡NO hardcodear!
+if not GOOGLE_API_KEY:
+    logger.warning("GOOGLE_API_KEY no está definido; el servicio fallará al invocar Gemini.")
 
+# Inicializa Gemini
+genai.configure(api_key=GOOGLE_API_KEY)
+
+kafka_consumer: Optional[AIOKafkaConsumer] = None
 kafka_producer: Optional[AIOKafkaProducer] = None
+consumer_task: Optional[asyncio.Task] = None
 
-# =======================
-# Utilidades
-# =======================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-async def fetch_questions_from_storage(limit: int = 50) -> List[Dict[str, Any]]:
+# =======================
+# LLM
+# =======================
+async def generate_gemini_response(prompt: str) -> str:
     """
-    Intenta obtener preguntas desde storage (/qa).
-    Devuelve una lista de items con campos: question_id, question, answer, score, created_at (según storage/api.py).
-    """
-    url = f"{STORAGE_SERVICE_URL}/qa"
-    params = {"limit": str(limit)}
-    timeout = aiohttp.ClientTimeout(total=5)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, params=params) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"storage /qa status={resp.status}")
-            data = await resp.json()
-            if not isinstance(data, list):
-                raise RuntimeError("storage /qa payload inesperado (se esperaba lista)")
-            return data
-
-async def get_random_question_from_storage() -> str:
-    """
-    Toma una pregunta desde storage si hay resultados; si no, usa fallback local.
+    Llama al modelo Gemini. Ejecutamos en executor porque el SDK es sincrónico.
     """
     try:
-        rows = await fetch_questions_from_storage(limit=50)
-        candidates = [r.get("question", "") for r in rows if r.get("question")]
-        if candidates:
-            q = random.choice(candidates).strip()
-            if q:
-                return q
-        logger.warning("Storage sin preguntas válidas; usando fallback.")
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+        txt = (resp.text or "").strip() if resp else ""
+        return txt or "Lo siento, no pude generar una respuesta para esa pregunta."
     except Exception as e:
-        logger.warning(f"No se pudo obtener preguntas de storage: {e}; usando fallback.")
+        # Re-lanzamos para que arriba clasifique el error (quota/overload)
+        raise
 
-    return random.choice(FALLBACK_QUESTIONS)
+def classify_error_for_topic(exc: Exception) -> str:
+    """
+    Heurística simple para clasificar errores:
+      - 429, 'quota', 'rate limit'  -> answers.error.quota
+      - 500/503, 'unavailable', 'timeout', 'overloaded' -> answers.error.overload
+      - por defecto -> overload
+    """
+    s = str(exc).lower()
+    if "429" in s or "quota" in s or "rate limit" in s or "exceeded" in s:
+        return TOPIC_ERR_QUOTA
+    if "503" in s or "500" in s or "unavailable" in s or "timeout" in s or "overload" in s or "overloaded" in s:
+        return TOPIC_ERR_OVERLOAD
+    return TOPIC_ERR_OVERLOAD
 
-async def send_to_kafka(message: Dict[str, Any]) -> None:
-    """
-    Envía un mensaje al tópico configurado, con key=id y headers de trazabilidad.
-    """
+# =======================
+# Kafka helpers
+# =======================
+async def send_json(topic: str, value: Dict[str, Any], key: Optional[str] = None, trace_id: Optional[str] = None):
     global kafka_producer
     if not kafka_producer:
         raise RuntimeError("Kafka producer no disponible")
-
-    key_bytes = message["id"].encode("utf-8")
+    key_bytes = key.encode("utf-8") if key else None
     headers = [
-        ("trace-id", message["id"].encode("utf-8")),
-        ("source", b"generator-service"),
+        ("trace-id", (trace_id or value.get("id", "")).encode("utf-8")),
+        ("source", b"llm-service"),
         ("sent-at", now_iso().encode("utf-8")),
-        # Puedes agregar ("content-type", b"application/json")
     ]
     await kafka_producer.send_and_wait(
-        TOPIC_REQUESTS,
-        value=message,
+        topic,
+        value=value,
         key=key_bytes,
         headers=headers,
     )
 
 # =======================
+# Consume & process
+# =======================
+async def process_message(msg: Dict[str, Any]):
+    """
+    msg esperado: { id, question, timestamp, attempt?, regens? }
+    Produce:
+      - answers.success: {question_id, question, answer}
+      - answers.error.overload|quota: {question_id, question, error, attempt}
+    """
+    q = (msg.get("question") or "").strip()
+    qid = msg.get("id") or msg.get("question_id") or ""
+    if not q:
+        logger.warning("Mensaje recibido sin 'question'; ignorando.")
+        return
+
+    try:
+        logger.info(f"Procesando pregunta {qid}: {q[:80]}...")
+        answer = await generate_gemini_response(q)
+        out = {
+            "question_id": qid,
+            "question": q,
+            "answer": answer,
+            "timestamp": msg.get("timestamp") or now_iso(),
+        }
+        await send_json(TOPIC_OK, out, key=qid, trace_id=qid)
+        logger.info(f"✓ success → {TOPIC_OK} ({qid})")
+
+    except Exception as e:
+        topic_err = classify_error_for_topic(e)
+        out = {
+            "question_id": qid,
+            "question": q,
+            "error": str(e),
+            "attempt": int(msg.get("attempt", 0)) + 1,
+            "timestamp": msg.get("timestamp") or now_iso(),
+        }
+        await send_json(topic_err, out, key=qid, trace_id=qid)
+        logger.warning(f"↻ routed error → {topic_err} ({qid}): {e}")
+
+async def consume_loop():
+    global kafka_consumer
+    try:
+        assert kafka_consumer is not None
+        async for record in kafka_consumer:
+            try:
+                data = record.value
+                await process_message(data)
+            except Exception as inner:
+                # continua consumiendo aunque falle un mensaje
+                logger.error(f"Error procesando record: {inner}")
+    except asyncio.CancelledError:
+        logger.info("consume_loop cancelado.")
+    except Exception as e:
+        logger.error(f"Fallo en consume_loop: {e}")
+
+# =======================
 # Ciclo de vida FastAPI
 # =======================
 async def init_kafka():
-    global kafka_producer
-    try:
-        kafka_producer = AIOKafkaProducer(
-            bootstrap_servers=BOOTSTRAP_SERVERS,
-            value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
-            acks="all",                 # mayor garantía
-            linger_ms=10,               # un pequeño batch
-            request_timeout_ms=15000,
-            retry_backoff_ms=500,
-        )
-        await kafka_producer.start()
-        logger.info(f"Kafka producer iniciado ({BOOTSTRAP_SERVERS}) → topic={TOPIC_REQUESTS}")
-    except Exception as e:
-        logger.error(f"Error al iniciar Kafka: {e}")
-        raise
+    global kafka_consumer, kafka_producer, consumer_task
+    kafka_consumer = AIOKafkaConsumer(
+        TOPIC_IN,
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        auto_offset_reset="earliest",
+        group_id="worker-llm",
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+        enable_auto_commit=True,
+    )
+    kafka_producer = AIOKafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+        acks="all",
+        linger_ms=10,
+        request_timeout_ms=15000,
+        retry_backoff_ms=500,
+    )
+    await kafka_consumer.start()
+    await kafka_producer.start()
+    logger.info(f"Kafka listo. Consumiendo de {TOPIC_IN} y produciendo a {TOPIC_OK}/{TOPIC_ERR_OVERLOAD}/{TOPIC_ERR_QUOTA}")
+    consumer_task = asyncio.create_task(consume_loop())
 
 async def close_kafka():
-    global kafka_producer
+    global kafka_consumer, kafka_producer, consumer_task
+    if consumer_task:
+        consumer_task.cancel()
+        with contextlib.suppress(Exception):
+            await consumer_task
+    if kafka_consumer:
+        await kafka_consumer.stop()
+        kafka_consumer = None
     if kafka_producer:
         await kafka_producer.stop()
         kafka_producer = None
-    logger.info("Kafka producer detenido")
+    logger.info("Conexiones Kafka cerradas.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -131,112 +191,25 @@ async def lifespan(app: FastAPI):
         await close_kafka()
 
 app = FastAPI(
-    title="Generator Service",
-    description="Servicio generador de tráfico de preguntas (Tarea 2)",
+    title="LLM Service",
+    description="Servicio de generación de respuestas (Gemini) para Tarea 2",
     version="1.1.0",
     lifespan=lifespan,
 )
-
-# =======================
-# Endpoints
-# =======================
-@app.post("/generate")
-async def generate_question():
-    try:
-        question = await get_random_question_from_storage()
-        msg = {
-            "id": str(uuid.uuid4()),
-            "question": question,
-            "timestamp": now_iso(),
-            # Campos útiles para downstream:
-            "attempt": 0,
-            "regens": 0,
-        }
-        await send_to_kafka(msg)
-        logger.info(f"→ pregunta enviada a {TOPIC_REQUESTS}: {question}")
-        return {"status": "success", "topic": TOPIC_REQUESTS, "question": question, "id": msg["id"]}
-    except Exception as e:
-        logger.error(f"Error /generate: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/generate/custom")
-async def generate_custom_question(payload: Dict[str, Any]):
-    try:
-        q = (payload.get("question") or "").strip()
-        if not q:
-            raise HTTPException(status_code=400, detail="Pregunta no puede estar vacía")
-        msg = {
-            "id": str(uuid.uuid4()),
-            "question": q,
-            "timestamp": now_iso(),
-            "attempt": 0,
-            "regens": 0,
-        }
-        await send_to_kafka(msg)
-        logger.info(f"→ pregunta personalizada enviada a {TOPIC_REQUESTS}: {q}")
-        return {"status": "success", "topic": TOPIC_REQUESTS, "question": q, "id": msg["id"]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error /generate/custom: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/generate/batch")
-async def generate_batch_questions(batch_data: Dict[str, Any]):
-    try:
-        # acepta num_questions o count; clamp 1..10000
-        count = batch_data.get("num_questions", batch_data.get("count", 5))
-        count = int(max(1, min(int(count), 10_000)))
-
-        ids: List[str] = []
-        # backpressure suave para no saturar
-        for _ in range(count):
-            q = await get_random_question_from_storage()
-            msg = {
-                "id": str(uuid.uuid4()),
-                "question": q,
-                "timestamp": now_iso(),
-                "attempt": 0,
-                "regens": 0,
-            }
-            await send_to_kafka(msg)
-            ids.append(msg["id"])
-            # micro-sleep evita monopolizar el event-loop cuando count es grande
-            await asyncio.sleep(0)
-
-        logger.info(f"→ batch enviado: {count} mensajes a {TOPIC_REQUESTS}")
-        return {"status": "success", "topic": TOPIC_REQUESTS, "count": count, "ids": ids[:100]}
-    except Exception as e:
-        logger.error(f"Error /generate/batch: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "service": "generator",
-        "kafka_connected": kafka_producer is not None,
+        "service": "llm",
+        "kafka_connected": (kafka_consumer is not None) and (kafka_producer is not None),
         "bootstrap": BOOTSTRAP_SERVERS,
-        "topic": TOPIC_REQUESTS,
+        "in": TOPIC_IN,
+        "out_ok": TOPIC_OK,
+        "out_err_overload": TOPIC_ERR_OVERLOAD,
+        "out_err_quota": TOPIC_ERR_QUOTA,
     }
 
 @app.get("/")
 async def root():
-    return {
-        "message": "Generator Service - Tarea 2",
-        "endpoints": {
-            "POST /generate": "Genera 1 pregunta desde storage/fallback",
-            "POST /generate/custom": "Genera 1 pregunta personalizada {question}",
-            "POST /generate/batch": "Genera N preguntas {num_questions}",
-            "GET /health": "Estado del servicio",
-        },
-        "config": {
-            "BOOTSTRAP_SERVERS": BOOTSTRAP_SERVERS,
-            "TOPIC_REQUESTS": TOPIC_REQUESTS,
-            "STORAGE_SERVICE_URL": STORAGE_SERVICE_URL,
-        },
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    return {"message": "LLM Service - Tarea 2 (Gemini→Kafka)"}
