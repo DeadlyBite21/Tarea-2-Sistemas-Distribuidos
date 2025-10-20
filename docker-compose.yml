@@ -83,5 +83,5 @@ services:
     depends_on:
       - kafka
 
-  volumes:
-    storage_data:
+volumes:
+  storage_data:
