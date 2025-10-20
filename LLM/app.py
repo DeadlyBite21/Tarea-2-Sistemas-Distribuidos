@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import google.generativeai as genai
@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("llm-service")
 
 # =======================
-# Configuración por entorno
+# Config vía entorno
 # =======================
 BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_IN = os.getenv("TOPIC_IN", "questions.pending")
@@ -21,11 +21,10 @@ TOPIC_OK = os.getenv("TOPIC_OK", "answers.success")
 TOPIC_ERR_OVERLOAD = os.getenv("TOPIC_ERR_OVERLOAD", "answers.error.overload")
 TOPIC_ERR_QUOTA = os.getenv("TOPIC_ERR_QUOTA", "answers.error.quota")
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # ¡NO hardcodear!
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # define esto en tu .env
 if not GOOGLE_API_KEY:
-    logger.warning("GOOGLE_API_KEY no está definido; el servicio fallará al invocar Gemini.")
+    logger.warning("GOOGLE_API_KEY no está definido (Gemini fallará al invocar).")
 
-# Inicializa Gemini
 genai.configure(api_key=GOOGLE_API_KEY)
 
 kafka_consumer: Optional[AIOKafkaConsumer] = None
@@ -36,27 +35,23 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 # =======================
-# LLM
+# Gemini
 # =======================
 async def generate_gemini_response(prompt: str) -> str:
     """
-    Llama al modelo Gemini. Ejecutamos en executor porque el SDK es sincrónico.
+    El SDK es sincrónico; se ejecuta en executor para no bloquear el loop.
     """
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
-        txt = (resp.text or "").strip() if resp else ""
-        return txt or "Lo siento, no pude generar una respuesta para esa pregunta."
-    except Exception as e:
-        # Re-lanzamos para que arriba clasifique el error (quota/overload)
-        raise
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    loop = asyncio.get_event_loop()
+    resp = await loop.run_in_executor(None, lambda: model.generate_content(prompt))
+    txt = (getattr(resp, "text", "") or "").strip()
+    return txt or "Lo siento, no pude generar una respuesta para esa pregunta."
 
 def classify_error_for_topic(exc: Exception) -> str:
     """
-    Heurística simple para clasificar errores:
-      - 429, 'quota', 'rate limit'  -> answers.error.quota
-      - 500/503, 'unavailable', 'timeout', 'overloaded' -> answers.error.overload
+    Heurística mínima para enrutar el error:
+      - 429 / 'quota' / 'rate limit' / 'exceeded'  -> quota
+      - 500/503 / 'timeout' / 'unavailable' / 'overload' -> overload
       - por defecto -> overload
     """
     s = str(exc).lower()
@@ -70,7 +65,6 @@ def classify_error_for_topic(exc: Exception) -> str:
 # Kafka helpers
 # =======================
 async def send_json(topic: str, value: Dict[str, Any], key: Optional[str] = None, trace_id: Optional[str] = None):
-    global kafka_producer
     if not kafka_producer:
         raise RuntimeError("Kafka producer no disponible")
     key_bytes = key.encode("utf-8") if key else None
@@ -87,7 +81,7 @@ async def send_json(topic: str, value: Dict[str, Any], key: Optional[str] = None
     )
 
 # =======================
-# Consume & process
+# Procesamiento
 # =======================
 async def process_message(msg: Dict[str, Any]):
     """
@@ -99,11 +93,11 @@ async def process_message(msg: Dict[str, Any]):
     q = (msg.get("question") or "").strip()
     qid = msg.get("id") or msg.get("question_id") or ""
     if not q:
-        logger.warning("Mensaje recibido sin 'question'; ignorando.")
+        logger.warning("Mensaje recibido sin 'question'; se ignora.")
         return
 
     try:
-        logger.info(f"Procesando pregunta {qid}: {q[:80]}...")
+        logger.info(f"Procesando {qid}: {q[:80]}...")
         answer = await generate_gemini_response(q)
         out = {
             "question_id": qid,
@@ -127,18 +121,15 @@ async def process_message(msg: Dict[str, Any]):
         logger.warning(f"↻ routed error → {topic_err} ({qid}): {e}")
 
 async def consume_loop():
-    global kafka_consumer
     try:
         assert kafka_consumer is not None
         async for record in kafka_consumer:
             try:
-                data = record.value
-                await process_message(data)
+                await process_message(record.value)
             except Exception as inner:
-                # continua consumiendo aunque falle un mensaje
                 logger.error(f"Error procesando record: {inner}")
     except asyncio.CancelledError:
-        logger.info("consume_loop cancelado.")
+        logger.info("consume_loop cancelado")
     except Exception as e:
         logger.error(f"Fallo en consume_loop: {e}")
 
@@ -152,8 +143,8 @@ async def init_kafka():
         bootstrap_servers=BOOTSTRAP_SERVERS,
         auto_offset_reset="earliest",
         group_id="worker-llm",
-        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
         enable_auto_commit=True,
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
     )
     kafka_producer = AIOKafkaProducer(
         bootstrap_servers=BOOTSTRAP_SERVERS,
@@ -165,22 +156,25 @@ async def init_kafka():
     )
     await kafka_consumer.start()
     await kafka_producer.start()
-    logger.info(f"Kafka listo. Consumiendo de {TOPIC_IN} y produciendo a {TOPIC_OK}/{TOPIC_ERR_OVERLOAD}/{TOPIC_ERR_QUOTA}")
+    logger.info(f"Kafka listo. IN={TOPIC_IN} OUT=({TOPIC_OK}, {TOPIC_ERR_OVERLOAD}, {TOPIC_ERR_QUOTA})")
+    # Lanza el consumo asíncrono
     consumer_task = asyncio.create_task(consume_loop())
 
 async def close_kafka():
     global kafka_consumer, kafka_producer, consumer_task
     if consumer_task:
         consumer_task.cancel()
-        with contextlib.suppress(Exception):
+        try:
             await consumer_task
+        except Exception:
+            pass
     if kafka_consumer:
         await kafka_consumer.stop()
         kafka_consumer = None
     if kafka_producer:
         await kafka_producer.stop()
         kafka_producer = None
-    logger.info("Conexiones Kafka cerradas.")
+    logger.info("Conexiones Kafka cerradas")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -213,3 +207,7 @@ async def health_check():
 @app.get("/")
 async def root():
     return {"message": "LLM Service - Tarea 2 (Gemini→Kafka)"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("llm_service:app", host="0.0.0.0", port=8003, reload=False)
