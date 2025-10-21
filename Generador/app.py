@@ -143,21 +143,43 @@ app = FastAPI(
 @app.post("/generate")
 async def generate_question():
     try:
-        question = await get_random_question_from_storage()
+        # 1. SELECCIONA UNA PREGUNTA (Tu lógica de fallback o de un CSV es mejor aquí)
+        #    Para este ejemplo, usaré tu lógica actual, pero idealmente
+        #    la fuente de preguntas debería ser externa (un archivo, etc.)
+        question = await get_random_question_from_storage() # O mejor: get_question_from_csv()
+
+        # 2. CONSULTA AL STORAGE (BDD) SI YA EXISTE
+        url = f"{STORAGE_SERVICE_URL}/check" # Necesitas un endpoint en la BDD
+        params = {"question": question}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # 3. SI EXISTE (con score), NO LA ENVÍES A KAFKA
+                    if data.get("processed") and data.get("score") is not None:
+                        logger.info(f"Pregunta ya procesada (Score: {data['score']}). Saltando envío a Kafka.")
+                        return {"status": "skipped", "message": "Question already processed", "data": data}
+                elif resp.status != 404:
+                    # Si no es un 404 (no encontrado), es un error
+                    logger.warning(f"Error al consultar storage/check: {resp.status}")
+                    # Decide si continuar o fallar. Continuemos por ahora.
+        
+        # 4. SI NO EXISTE, ENVÍA A KAFKA
         msg = {
             "id": str(uuid.uuid4()),
             "question": question,
             "timestamp": now_iso(),
-            # Campos útiles para downstream:
             "attempt": 0,
             "regens": 0,
         }
         await send_to_kafka(msg)
-        logger.info(f"→ pregunta enviada a {TOPIC_REQUESTS}: {question}")
+        logger.info(f"→ Nueva pregunta enviada a {TOPIC_REQUESTS}: {question}")
         return {"status": "success", "topic": TOPIC_REQUESTS, "question": question, "id": msg["id"]}
+
     except Exception as e:
         logger.error(f"Error /generate: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/generate/custom")
 async def generate_custom_question(payload: Dict[str, Any]):
