@@ -55,8 +55,10 @@ services:
     build: ./generator
     environment:
       - BOOTSTRAP_SERVERS=kafka:9092
+      - TOPIC_REQUESTS=questions.llm
     depends_on:
       - kafka
+      - bdd
     restart: on-failure
       
   llm:
