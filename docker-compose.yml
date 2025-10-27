@@ -57,6 +57,7 @@ services:
       - BOOTSTRAP_SERVERS=kafka:9092
     depends_on:
       - kafka
+    restart: on-failure
       
   llm:
     build: ./llm
