@@ -55,14 +55,9 @@ services:
     build: ./generator
     environment:
       - BOOTSTRAP_SERVERS=kafka:9092
-      # Apunta al nombre del servicio BDD y su puerto INTERNO
-      - STORAGE_SERVICE_URL=http://BDD:8000
-    ports:
-      - "8000:8000" # Puerto principal
     depends_on:
       - kafka
-      - BDD
-
+      
   llm:
     build: ./llm
     ports:
@@ -72,6 +67,7 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - BOOTSTRAP_SERVERS=kafka:9092
       - LLM_MODEL=mock
+      - TOPIC_REQUESTS=questions.llm
     depends_on:
       - kafka
 
@@ -91,8 +87,8 @@ services:
 
   # --- CORREGIDO ---
   # Renombrado de 'DataBase' a 'BDD' para que 'generator' lo encuentre
-  BDD:
-    build: ./BDD
+  bdd:
+    build: ./bdd
     environment:
     - BOOTSTRAP_SERVERS=kafka:9092
     - DB_URL=sqlite:///data/data.db # Ruta dentro del volumen
