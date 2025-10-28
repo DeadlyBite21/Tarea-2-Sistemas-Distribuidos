@@ -40,16 +40,105 @@ logger.info(f"  Publicando (Regen) en: {TOPIC_OUTPUT_REGENERATE}")
 logger.info(f"  Umbral de Score: {SCORE_THRESHOLD}")
 logger.info(f"  Máx. Regeneraciones: {MAX_REGENERATIONS}")
 
-# =================================================================
-# Lógica de Negocio (calculate_score, normalize_text, etc. - Sin cambios)
-# =================================================================
+STOP_WORDS_EN = set([
+    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours", 
+    "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers", 
+    "herself", "it", "its", "itself", "they", "them", "their", "theirs", "themselves", 
+    "what", "which", "who", "whom", "this", "that", "these", "those", "am", "is", "are", 
+    "was", "were", "be", "been", "being", "have", "has", "had", "having", "do", "does", 
+    "did", "doing", "a", "an", "the", "and", "but", "if", "or", "because", "as", "until", 
+    "while", "of", "at", "by", "for", "with", "about", "against", "between", "into", 
+    "through", "during", "before", "after", "above", "below", "to", "from", "up", "down", 
+    "in", "out", "on", "off", "over", "under", "again", "further", "then", "once", "here", 
+    "there", "when", "where", "why", "how", "all", "any", "both", "each", "few", "more", 
+    "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so", 
+    "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now", "?"
+])
 
-# ... (Pega aquí tus funciones calculate_score, normalize_text, STOP_WORDS_EN, BAD_PHRASES_EN) ...
+# Frases genéricas/malas SOLO en inglés
+BAD_PHRASES_EN = [
+    "i don't know", "search google", "good question", "try this link", 
+    "check this out", "i guess", "maybe", "sorry"
+]
 
+def normalize_text(text):
+    """Limpia el texto: minúsculas, sin puntuación extraña."""
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", "", text) # Quita puntuación
+    text = re.sub(r"\s+", " ", text).strip() # Normaliza espacios
+    return text
 
-# =================================================================
-# Definición de Clases de Mapeo (Operan sobre dicts parseados)
-# =================================================================
+def calculate_score(message: dict) -> float:
+    """
+    Calcula un score heurístico para la calidad de la respuesta (EN INGLÉS).
+    Combina longitud, coincidencia de palabras clave, formato y frases malas.
+    Devuelve un float entre 0.0 y 1.0.
+    """
+    question = message.get("question", "")
+    answer = message.get("answer", "")
+    
+    # Scores iniciales
+    score_length = 0.0
+    score_keywords = 0.0
+    score_format = 0.0
+    score_bad_phrases = 1.0 
+
+    # --- 1. Score de Longitud ---
+    len_ans = len(answer)
+    if 50 <= len_ans <= 600: score_length = 1.0
+    elif 20 <= len_ans < 50: score_length = 0.5
+    elif len_ans > 600: score_length = 0.3
+    # Verificación de seguridad para answer vacío (aunque get("", "") lo previene)
+    elif len_ans == 0: score_length = 0.0
+    else: score_length = 0.1 # Muy corta (< 20)
+
+    # --- 2. Score de Palabras Clave ---
+    if question and answer:
+        clean_q = normalize_text(question)
+        clean_a = normalize_text(answer)
+        
+        q_words = set(clean_q.split()) - STOP_WORDS_EN
+        a_words = set(clean_a.split())
+        
+        if q_words: 
+            matched_keywords = q_words.intersection(a_words)
+            score_keywords = len(matched_keywords) / len(q_words)
+            if score_keywords > 0: score_keywords = min(score_keywords + 0.2, 1.0) 
+        else:
+            score_keywords = 0.1 
+
+    # --- 3. Score de Formato Básico ---
+    # ¡CORREGIDO! Añadir chequeo 'if answer:' para evitar IndexError en answer[0]
+    if answer: 
+        if answer[0].isupper() and answer[-1] in ".!?": score_format = 1.0
+        elif answer[0].isupper() or answer[-1] in ".!?": score_format = 0.5
+        else: score_format = 0.1
+    else:
+        score_format = 0.0 # Sin respuesta, sin score de formato
+
+    # --- 4. Penalización por Frases Malas ---
+    clean_a_lower = answer.lower() 
+    for phrase in BAD_PHRASES_EN: 
+        if phrase in clean_a_lower:
+            score_bad_phrases = 0.0 
+            logger.warning(f"Respuesta (ID: {message.get('id', 'N/A')}) contiene frase mala: '{phrase}'")
+            break
+
+    # --- 5. Combinación Ponderada ---
+    weight_length = 0.3
+    weight_keywords = 0.4
+    weight_format = 0.3
+
+    final_score = (weight_length * score_length +
+                   weight_keywords * score_keywords +
+                   weight_format * score_format)
+    
+    final_score *= score_bad_phrases
+    final_score = max(0.0, min(final_score, 1.0))
+    
+    return float(final_score)
 
 class Scorer(object):
     """
