@@ -12,7 +12,7 @@ from pyflink.datastream.connectors.kafka import (
 )
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.typeinfo import Types
-from pyflink.datastream.watermark_strategy import WatermarkStrategy
+from pyflink.common.watermark_strategy import WatermarkStrategy
 from pyflink.common import Duration
 from pyflink.common import Row
 

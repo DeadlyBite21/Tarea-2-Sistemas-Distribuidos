@@ -37,7 +37,9 @@ services:
       - TOPIC_OUTPUT_REGENERATE=questions.llm
       # Eliminamos FLINK_PROPERTIES si limpiaste el Dockerfile (copiando el JAR a lib)
     ports: ["8081:8081"]
-    depends_on: [kafka]
+    depends_on:
+    - kafka
+    - llm
 
   flink-taskmanager:
     build:
