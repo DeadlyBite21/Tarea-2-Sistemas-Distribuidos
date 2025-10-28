@@ -1,15 +1,15 @@
 # En: flink_job/Dockerfile
 
-# 1. Empieza desde la imagen oficial de Flink
+# 1. Empieza desde la imagen oficial de Flink (base Java)
 FROM flink:1.18.1-scala_2.12
 
-# 2. Cambia al usuario root para instalar paquetes
+# 2. Cambia al usuario root para instalar
 USER root
 
-# 3. Instalar wget + JDK + build-essential + Python y setear JAVA_HOME
+# 3. Instalar wget, JDK, build-essential, Python DEV y PIP
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        wget \ 
+        wget \
         default-jdk \
         build-essential \
         python3 \
@@ -19,21 +19,38 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/default-java
 
-# --- CORRECCIÓN FINAL V4: Descargar el JAR del conector ---
-ARG KAFKA_CONNECTOR_VERSION=3.1.0-1.18
-ARG KAFKA_CONNECTOR_URL=https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/${KAFKA_CONNECTOR_VERSION}/flink-sql-connector-kafka-${KAFKA_CONNECTOR_VERSION}.jar
+# 4. Copiar/Descargar el JAR del conector Kafka a /opt/flink/lib
+RUN cp /opt/flink/connectors/*.jar /opt/flink/lib/ || \
+    (echo "WARN: Kafka connector JAR not found..." && \
+     wget https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.1.0-1.18/flink-sql-connector-kafka-3.1.0-1.18.jar -O /opt/flink/lib/flink-sql-connector-kafka.jar)
 
-RUN wget ${KAFKA_CONNECTOR_URL} -O /opt/flink/lib/flink-sql-connector-kafka.jar
-# --- FIN CORRECCIÓN FINAL V4 ---
-
-# 4. Copia solo el archivo de requisitos
+# 5. Crea directorio, copia requisitos
+RUN mkdir -p /opt/flink/job
 COPY requirements.txt /opt/flink/job/requirements.txt
 
-# 5. Instala las dependencias de PyFlink
+# 6. Actualizar pip y setuptools
+RUN python3 -m pip install --upgrade pip setuptools
+
+# 7. Instala las dependencias
 RUN python3 -m pip install --no-cache-dir -r /opt/flink/job/requirements.txt
 
-# 6. Copia el código de tu job de Flink
-COPY app.py /opt/flink/job/app.py
+# 8. --- Configurar el entorno Python ---
+ENV PYTHONPATH=/usr/local/lib/python3.10/site-packages:/usr/local/lib/python3.10/dist-packages:/opt/flink/lib:${PYTHONPATH}
 
-# 7. Vuelve al usuario por defecto de Flink ('flink')
+# 9. --- Instalar y verificar pyflink ---
+RUN python3 -m pip install --no-cache-dir apache-flink==1.18.1 apache-flink-libraries==1.18.1 && \
+    python3 -m pip show apache-flink | grep Location && \
+    ls -R /usr/local/lib/python3.10/dist-packages/pyflink/datastream/ && \
+    python3 -c "from pyflink.datastream import TimeCharacteristic; print('Basic import successful')" && \
+    python3 -c "from pyflink.datastream.functions import KeySelector; print('Functions import successful')" && \
+    python3 -c "import pyflink.datastream as ds; print(dir(ds))" && \
+    echo "Attempting WatermarkStrategy import..." && \
+    python3 -c "from pyflink.common.watermark_strategy import WatermarkStrategy; print('***** WatermarkStrategy import OK during build *****')"
+
+# 10. Copia el código del job y cambia permisos
+COPY app.py /opt/flink/job/app.py
+RUN chown -R flink:flink /opt/flink/job
+
+# 11. Vuelve al usuario por defecto de Flink ('flink')
 USER flink
+WORKDIR /opt/flink

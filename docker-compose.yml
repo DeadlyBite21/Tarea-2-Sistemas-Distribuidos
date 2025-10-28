@@ -12,21 +12,19 @@ services:
     ports: ["9092:9092"]
 
   flink-jobmanager:
-    # --- Usa 'build' para crear la imagen personalizada ---
-    build: 
-      context: ./flink_job # Directorio con el Dockerfile de Flink
-    user: flink # Vuelve a usar el usuario 'flink', Python ya está instalado
-    volumes: 
-      - ./flink_job:/opt/flink/job # Monta el código para desarrollo
-    # --- Comando simplificado ---
+    build:
+      context: ./flink_job
+    user: flink # Ejecuta como flink
+    volumes:
+      - ./flink_job:/opt/flink/job
     command: |
       bash -c "
-      # Solo inicia jobmanager y envía el job
       /docker-entrypoint.sh jobmanager &
       JOBMANAGER_PID=$$!
       echo 'Esperando 10s para que el cluster inicie...';
-      sleep 10; 
+      sleep 10;
       echo 'Enviando trabajo de Flink (app.py)...';
+      # --- Ya no se necesita PYTHONPATH ---
       flink run -py /opt/flink/job/app.py;
       wait $$JOBMANAGER_PID
       "
@@ -37,26 +35,20 @@ services:
       - TOPIC_INPUT=questions.answers
       - TOPIC_OUTPUT_VALIDATED=questions.validated
       - TOPIC_OUTPUT_REGENERATE=questions.llm
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: ${JOB_MANAGER_RPC_ADDRESS}
+      # Eliminamos FLINK_PROPERTIES si limpiaste el Dockerfile (copiando el JAR a lib)
     ports: ["8081:8081"]
     depends_on: [kafka]
 
   flink-taskmanager:
-    # --- Usa 'build' para crear la imagen personalizada ---
     build:
-      context: ./flink_job # Usa el mismo Dockerfile
-    user: flink # Vuelve a usar el usuario 'flink', Python ya está instalado
-    volumes: 
-      - ./flink_job:/opt/flink/job # Monta el código
-    # --- Comando muy simplificado ---
-    command: taskmanager # Solo inicia el taskmanager
+      context: ./flink_job
+    user: flink # Ejecuta como flink
+    volumes:
+      - ./flink_job:/opt/flink/job
+    command: taskmanager # TaskManager recogerá el PYTHONPATH automáticamente
     environment:
       - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: ${JOB_MANAGER_RPC_ADDRESS}
+      # Eliminamos FLINK_PROPERTIES si limpiaste el Dockerfile
     depends_on: [flink-jobmanager]
 
   generator:
@@ -66,7 +58,7 @@ services:
     depends_on:
       - bdd
     restart: on-failure
-      
+
   llm:
     build: ./llm
     ports:
@@ -74,7 +66,7 @@ services:
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - BOOTSTRAP_SERVERS=kafka:9092
-      - TOPIC_REQUESTS=questions.llm 
+      - TOPIC_REQUESTS=questions.llm
     depends_on:
       - kafka
 
@@ -96,21 +88,21 @@ services:
     build: ./bdd
     environment:
     - BOOTSTRAP_SERVERS=kafka:9092
-    - DB_URL=sqlite:///data/data.db 
+    - DB_URL=sqlite:///data/data.db
     volumes:
       - storage_data:/app/data
     ports:
-      - "8001:8000" 
+      - "8001:8000"
     depends_on: [kafka]
 
   kafdrop:
-    image: obsidiandynamics/kafdrop:latest
+    image: obsidiandynamics/kafdrop:4.1.0
     restart: "no"
     ports:
       - "9000:9000"
     environment:
       KAFKA_BROKERCONNECT: "kafka:9092"
-      JVM_OPTS: "-Xms16M -Xmx48M -Xss180K -XX:-TieredCompilation -XX:+UseStringDeduplication -noverify"
+      JVM_OPTS: "-Xms32M -Xmx256M -Xss180K -XX:-TieredCompilation -XX:+UseStringDeduplication -noverify"
     depends_on:
       - kafka
 
