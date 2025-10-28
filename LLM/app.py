@@ -38,7 +38,7 @@ if not GOOGLE_API_KEY:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 # CORREGIDO: 'gemini-1.5-flash' es un modelo real.
-GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-flash')
+GEMINI_MODEL = genai.GenerativeModel('gemini-2.5-pro')
 
 # Variables globales para los clientes de Kafka
 kafka_consumer: Optional[AIOKafkaConsumer] = None

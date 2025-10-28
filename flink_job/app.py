@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from pyflink.datastream import StreamExecutionEnvironment
@@ -42,29 +43,101 @@ logger.info(f"  Máx. Regeneraciones: {MAX_REGENERATIONS}")
 # Lógica de Negocio (¡AQUÍ PONES TU SCORE!)
 # =================================================================
 
+# Lista de "stop words" SOLO en inglés (puedes expandirla)
+STOP_WORDS_EN = set([
+    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours", 
+    "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers", 
+    "herself", "it", "its", "itself", "they", "them", "their", "theirs", "themselves", 
+    "what", "which", "who", "whom", "this", "that", "these", "those", "am", "is", "are", 
+    "was", "were", "be", "been", "being", "have", "has", "had", "having", "do", "does", 
+    "did", "doing", "a", "an", "the", "and", "but", "if", "or", "because", "as", "until", 
+    "while", "of", "at", "by", "for", "with", "about", "against", "between", "into", 
+    "through", "during", "before", "after", "above", "below", "to", "from", "up", "down", 
+    "in", "out", "on", "off", "over", "under", "again", "further", "then", "once", "here", 
+    "there", "when", "where", "why", "how", "all", "any", "both", "each", "few", "more", 
+    "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so", 
+    "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now", "?"
+])
+
+# Frases genéricas/malas SOLO en inglés
+BAD_PHRASES_EN = [
+    "i don't know", "search google", "good question", "try this link", 
+    "check this out", "i guess", "maybe", "sorry"
+]
+
+def normalize_text(text):
+    """Limpia el texto: minúsculas, sin puntuación extraña."""
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", "", text) # Quita puntuación
+    text = re.sub(r"\s+", " ", text).strip() # Normaliza espacios
+    return text
+
 def calculate_score(message: dict) -> float:
     """
-    
-    AQUÍ DEBES IMPLEMENTAR LA LÓGICA DE SCORE DE TU TAREA 1.
-    
-    Esta función recibe el mensaje completo desde el LLM
-    (que contiene 'question' y 'answer') y debe devolver un score.
-    
-    Como placeholder, usamos una lógica simple. 
-    ¡DEBES REEMPLAZAR ESTO!
+    Calcula un score heurístico para la calidad de la respuesta (EN INGLÉS).
+    Combina longitud, coincidencia de palabras clave, formato y frases malas.
+    Devuelve un float entre 0.0 y 1.0.
     """
     question = message.get("question", "")
     answer = message.get("answer", "")
     
-    if not question or not answer:
-        return 0.0
+    # Scores iniciales
+    score_length = 0.0
+    score_keywords = 0.0
+    score_format = 0.0
+    score_bad_phrases = 1.0 
+
+    # --- 1. Score de Longitud ---
+    len_ans = len(answer)
+    if 50 <= len_ans <= 600: score_length = 1.0
+    elif 20 <= len_ans < 50: score_length = 0.5
+    elif len_ans > 600: score_length = 0.3
+    else: score_length = 0.1 
+
+    # --- 2. Score de Palabras Clave ---
+    if question and answer:
+        clean_q = normalize_text(question)
+        clean_a = normalize_text(answer)
+        
+        q_words = set(clean_q.split()) - STOP_WORDS_EN # Usar stop words en inglés
+        a_words = set(clean_a.split())
+        
+        if q_words: 
+            matched_keywords = q_words.intersection(a_words)
+            score_keywords = len(matched_keywords) / len(q_words)
+            if score_keywords > 0: score_keywords = min(score_keywords + 0.2, 1.0) 
+        else:
+            score_keywords = 0.1 
+
+    # --- 3. Score de Formato Básico ---
+    if answer:
+        if answer[0].isupper() and answer[-1] in ".!?": score_format = 1.0
+        elif answer[0].isupper() or answer[-1] in ".!?": score_format = 0.5
+        else: score_format = 0.1
+
+    # --- 4. Penalización por Frases Malas ---
+    clean_a_lower = answer.lower() 
+    for phrase in BAD_PHRASES_EN: # Usar frases malas en inglés
+        if phrase in clean_a_lower:
+            score_bad_phrases = 0.0 
+            logger.warning(f"Respuesta (ID: {message.get('id', 'N/A')}) contiene frase mala: '{phrase}'")
+            break
+
+    # --- 5. Combinación Ponderada ---
+    weight_length = 0.3
+    weight_keywords = 0.4
+    weight_format = 0.3
+
+    final_score = (weight_length * score_length +
+                   weight_keywords * score_keywords +
+                   weight_format * score_format)
     
-    # --- INICIO PLACEHOLDER ---
-    # Ejemplo: score basado en la longitud de la respuesta
-    score = min(len(answer) / 200.0, 1.0)
-    # --- FIN PLACEHOLDER ---
+    final_score *= score_bad_phrases
+    final_score = max(0.0, min(final_score, 1.0))
     
-    return float(score)
+    return float(final_score)
 
 # =================================================================
 # Definición de Clases de Mapeo (Transformaciones)

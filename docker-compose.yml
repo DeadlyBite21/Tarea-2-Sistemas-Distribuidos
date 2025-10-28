@@ -12,27 +12,23 @@ services:
     ports: ["9092:9092"]
 
   flink-jobmanager:
-    build: ./flink_custom  # <--- CAMBIO
-    volumes:
-      - ./flink_job:/opt/flink/job
+    # --- Usa 'build' para crear la imagen personalizada ---
+    build: 
+      context: ./flink_job # Directorio con el Dockerfile de Flink
+    user: flink # Vuelve a usar el usuario 'flink', Python ya está instalado
+    volumes: 
+      - ./flink_job:/opt/flink/job # Monta el código para desarrollo
+    # --- Comando simplificado ---
     command: |
       bash -c "
-      set -e # <-- AÑADIDO: Falla si un comando falla
-      
-      echo 'Iniciando JobManager...';
+      # Solo inicia jobmanager y envía el job
       /docker-entrypoint.sh jobmanager &
-      JOBMANAGER_PID=$$! # <--- CAMBIO: Escapado para bash
-      
-      echo 'Esperando 15s para que el cluster inicie...';
-      sleep 15;
-      
-      echo 'Instalando dependencias de PyFlink...';
-      python3 -m pip install -r /opt/flink/job/requirements.txt; # <--- CAMBIO: Usa python3 -m pip
-      
+      JOBMANAGER_PID=$$!
+      echo 'Esperando 10s para que el cluster inicie...';
+      sleep 10; 
       echo 'Enviando trabajo de Flink (app.py)...';
       flink run -py /opt/flink/job/app.py;
-      
-      wait $$JOBMANAGER_PID # <--- CAMBIO: Escapado para bash
+      wait $$JOBMANAGER_PID
       "
     environment:
       - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
@@ -41,23 +37,32 @@ services:
       - TOPIC_INPUT=questions.answers
       - TOPIC_OUTPUT_VALIDATED=questions.validated
       - TOPIC_OUTPUT_REGENERATE=questions.llm
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: ${JOB_MANAGER_RPC_ADDRESS}
     ports: ["8081:8081"]
     depends_on: [kafka]
 
   flink-taskmanager:
-    build: ./flink_custom  # <--- CAMBIO
-    volumes:
-      - ./flink_job:/opt/flink/job
-    command: taskmanager
+    # --- Usa 'build' para crear la imagen personalizada ---
+    build:
+      context: ./flink_job # Usa el mismo Dockerfile
+    user: flink # Vuelve a usar el usuario 'flink', Python ya está instalado
+    volumes: 
+      - ./flink_job:/opt/flink/job # Monta el código
+    # --- Comando muy simplificado ---
+    command: taskmanager # Solo inicia el taskmanager
     environment:
       - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: ${JOB_MANAGER_RPC_ADDRESS}
     depends_on: [flink-jobmanager]
 
   generator:
     build: ./generator
     environment:
-      - BOOTSTRAP_SERVERS=kafka:9092
-      - TOPIC_REQUESTS=questions.llm
+      - STORAGE_SERVICE_URL=http://bdd:8000
     depends_on:
       - bdd
     restart: on-failure
@@ -67,11 +72,9 @@ services:
     ports:
       - "8003:8003"
     environment:
-      # Lee la clave desde el archivo .env
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - BOOTSTRAP_SERVERS=kafka:9092
-      - LLM_MODEL=mock
-      - TOPIC_REQUESTS=questions.llm
+      - TOPIC_REQUESTS=questions.llm 
     depends_on:
       - kafka
 
@@ -89,19 +92,15 @@ services:
     - BOOTSTRAP_SERVERS=kafka:9092
     depends_on: [kafka]
 
-  # --- CORREGIDO ---
-  # Renombrado de 'DataBase' a 'BDD' para que 'generator' lo encuentre
   bdd:
     build: ./bdd
     environment:
     - BOOTSTRAP_SERVERS=kafka:9092
-    - DB_URL=sqlite:///data/data.db # Ruta dentro del volumen
-    - SCORE_THRESHOLD=0.62
+    - DB_URL=sqlite:///data/data.db 
     volumes:
-      # Monta el volumen en /app/data
       - storage_data:/app/data
     ports:
-      - "8001:8000" # Puerto 8001 en el host, 8000 en el contenedor
+      - "8001:8000" 
     depends_on: [kafka]
 
   kafdrop:
