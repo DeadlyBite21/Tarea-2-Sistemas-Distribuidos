@@ -12,25 +12,27 @@ services:
     ports: ["9092:9092"]
 
   flink-jobmanager:
-    image: flink:1.18.1-scala_2.12
+    build: ./flink_custom  # <--- CAMBIO
     volumes:
       - ./flink_job:/opt/flink/job
     command: |
       bash -c "
+      set -e # <-- AÑADIDO: Falla si un comando falla
+      
       echo 'Iniciando JobManager...';
       /docker-entrypoint.sh jobmanager &
-      JOBMANAGER_PID=$!
+      JOBMANAGER_PID=$$! # <--- CAMBIO: Escapado para bash
       
       echo 'Esperando 15s para que el cluster inicie...';
       sleep 15;
       
       echo 'Instalando dependencias de PyFlink...';
-      pip install -r /opt/flink/job/requirements.txt;
+      python3 -m pip install -r /opt/flink/job/requirements.txt; # <--- CAMBIO: Usa python3 -m pip
       
       echo 'Enviando trabajo de Flink (app.py)...';
       flink run -py /opt/flink/job/app.py;
       
-      wait $JOBMANAGER_PID
+      wait $$JOBMANAGER_PID # <--- CAMBIO: Escapado para bash
       "
     environment:
       - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
@@ -43,7 +45,7 @@ services:
     depends_on: [kafka]
 
   flink-taskmanager:
-    image: flink:1.18.1-scala_2.12
+    build: ./flink_custom  # <--- CAMBIO
     volumes:
       - ./flink_job:/opt/flink/job
     command: taskmanager
