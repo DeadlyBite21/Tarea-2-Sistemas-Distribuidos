@@ -3,15 +3,15 @@ import json
 import threading
 import time
 import logging
-import uuid # <-- 1. Necesario para nuevos IDs de mensajes
+import uuid 
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import JSONResponse # <-- 2. Para devolver status 202
+from fastapi.responses import JSONResponse 
 from sqlalchemy import create_engine, Column, String, Float, Integer
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy.exc import OperationalError
-from kafka import KafkaConsumer, KafkaProducer # <-- 3. Importar Productor
+from kafka import KafkaConsumer, KafkaProducer 
 from kafka.errors import NoBrokersAvailable
-from pydantic import BaseModel # <-- 4. Para validar el request
+from pydantic import BaseModel 
 from contextlib import asynccontextmanager
 
 # =================================================================
@@ -24,15 +24,12 @@ DB_URL = os.getenv("DB_URL", "sqlite:///./data/data.db")
 BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
 
 # Tópicos
-TOPIC_CONSUME_VALIDATED = "questions.validated" # De Flink
-TOPIC_PRODUCE_NEW = "questions.llm"         # Hacia el LLM
+TOPIC_CONSUME_VALIDATED = "questions.validated" 
+TOPIC_PRODUCE_NEW = "questions.llm"         
 
 # Variable global para el productor
 kafka_producer: KafkaProducer = None
 
-# =================================================================
-# SECCIÓN 1: Base de Datos (Sin cambios)
-# =================================================================
 os.makedirs(os.path.dirname(DB_URL.split("///")[-1]), exist_ok=True)
 engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -57,9 +54,6 @@ def get_db():
     finally:
         db.close()
 
-# =================================================================
-# SECCIÓN 2: Consumidor de Kafka (Sin cambios)
-# =================================================================
 def consume_results_from_kafka():
     logger.info("Iniciando hilo consumidor de Kafka...")
     while True:
@@ -72,7 +66,6 @@ def consume_results_from_kafka():
                 value_deserializer=lambda v: json.loads(v.decode('utf-8'))
             )
             logger.info(f"Consumidor conectado. Escuchando tópico: {TOPIC_CONSUME_VALIDATED}")
-            # ... (el resto de tu lógica de consumidor no cambia) ...
             for message in consumer:
                 try:
                     data = message.value
@@ -105,10 +98,6 @@ def consume_results_from_kafka():
             logger.error(f"Error al conectar consumidor de Kafka: {e}. Reintentando...")
             time.sleep(5)
 
-# =================================================================
-# SECCIÓN 3: API Web (¡Aquí están los cambios!)
-# =================================================================
-
 def create_kafka_producer():
     """Función para conectar el productor de Kafka con reintentos."""
     global kafka_producer
@@ -127,12 +116,9 @@ def create_kafka_producer():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Iniciando lifespan (startup)...")
-    # 1. Crea las tablas
     create_db_and_tables()
-    # 2. Inicia el consumidor en un hilo
     consumer_thread = threading.Thread(target=consume_results_from_kafka, daemon=True)
     consumer_thread.start()
-    # 3. Inicia el productor en un hilo (solo para la conexión)
     producer_thread = threading.Thread(target=create_kafka_producer, daemon=True)
     producer_thread.start()
     
@@ -144,7 +130,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Servicio de Almacenamiento y Gateway", lifespan=lifespan)
 
-# Modelo Pydantic para el POST
 class QuestionRequest(BaseModel):
     question: str
 
@@ -160,11 +145,9 @@ async def process_question(request: QuestionRequest, db: Session = Depends(get_d
     question_text = request.question.strip()
 
     try:
-        # 1. Consultar el caché (BDD)
         result = db.query(QuestionAnswer).filter(QuestionAnswer.question == question_text).first()
         
         if result and result.score is not None:
-            # 2. CACHE HIT: Encontrada. Devolver 200 OK.
             logger.info(f"GATEWAY (HIT): Pregunta encontrada en BDD. {question_text[:30]}...")
             return {
                 "status": "cache_hit",
@@ -174,7 +157,6 @@ async def process_question(request: QuestionRequest, db: Session = Depends(get_d
                 "score": result.score
             }
         else:
-            # 3. CACHE MISS: No encontrada. Enviar a Kafka.
             logger.info(f"GATEWAY (MISS): Encolando en Kafka. {question_text[:30]}...")
             
             if not kafka_producer:
@@ -189,11 +171,9 @@ async def process_question(request: QuestionRequest, db: Session = Depends(get_d
                 "regens": 0
             }
             
-            # Enviar al tópico del LLM
             kafka_producer.send(TOPIC_PRODUCE_NEW, message)
             kafka_producer.flush()
             
-            # Devolver 202 Accepted
             return JSONResponse(
                 status_code=202, 
                 content={"status": "queued", "id": message["id"]}
@@ -206,7 +186,6 @@ async def process_question(request: QuestionRequest, db: Session = Depends(get_d
         logger.error(f"Error inesperado en /process_question: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# Dejamos los otros endpoints por si los quieres usar para depurar
 @app.get("/qa")
 async def get_all_questions(limit: int = 50, db: Session = Depends(get_db)):
     return db.query(QuestionAnswer).limit(limit).all()

@@ -10,9 +10,9 @@ logger = logging.getLogger("retry_overload")
 
 # Configuración
 BOOTSTRAP_SERVERS = os.getenv("BOOTSTRAP_SERVERS", "kafka:9092")
-TOPIC_INPUT = "llm.errors.overload" # De dónde consume
-TOPIC_OUTPUT = "questions.llm"     # A dónde produce
-RETRY_DELAY_SECONDS = 5            # Espera corta para sobrecarga
+TOPIC_INPUT = "llm.errors.overload" 
+TOPIC_OUTPUT = "questions.llm"    
+RETRY_DELAY_SECONDS = 5            
 
 def create_kafka_client(client_type):
     """Crea un cliente Kafka (Productor o Consumidor) con reintentos."""
@@ -48,16 +48,12 @@ def main():
             data = message.value
             msg_id = data.get('id', 'N/A')
             
-            # 1. Log del error recibido
             logger.warning(f"Error de SOBRECARGA recibido (ID: {msg_id}). Esperando {RETRY_DELAY_SECONDS}s...")
             
-            # 2. Aplicar la lógica de reintento (espera corta)
             time.sleep(RETRY_DELAY_SECONDS)
             
-            # 3. Incrementar contador de intentos (opcional pero bueno)
             data['attempt'] = data.get('attempt', 0) + 1
             
-            # 4. Devolver a la cola principal del LLM
             producer.send(TOPIC_OUTPUT, data)
             logger.info(f"Re-encolado (ID: {msg_id}) en '{TOPIC_OUTPUT}' (Intento: {data['attempt']}).")
             

@@ -4,16 +4,14 @@ import json
 import time
 import logging
 import random
-import httpx # Sigue siendo necesario
+import httpx 
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("simple_generator")
 
-# --- Configuración ---
 DATASET_PATH = "/app/train.csv"
 GENERATION_INTERVAL_SECONDS = 5
-# URL del servicio BDD (desde docker-compose)
 BDD_SERVICE_URL = os.getenv("STORAGE_SERVICE_URL", "http://bdd:8000")
 
 def load_questions_from_csv():
@@ -44,7 +42,6 @@ def send_question_to_gateway(question: str):
     """
     try:
         url = f"{BDD_SERVICE_URL}/process_question"
-        # Envía la pregunta en el cuerpo (body) de un POST
         response = httpx.post(url, json={"question": question}, timeout=10.0)
         
         if response.status_code == 200:
@@ -63,13 +60,12 @@ def send_question_to_gateway(question: str):
 def run_generator_loop(questions):
     """Bucle infinito para generar tráfico."""
     logger.info("Iniciando bucle de generación de tráfico...")
-    client = httpx.Client() # Usamos un cliente persistente
+    client = httpx.Client()
     
     while True:
         try:
             question_text = random.choice(questions)
             
-            # Simplemente envía la pregunta al gateway
             send_question_to_gateway(question_text)
             
             time.sleep(GENERATION_INTERVAL_SECONDS)
@@ -84,7 +80,6 @@ if __name__ == "__main__":
     
     questions = load_questions_from_csv()
     if questions:
-        # Pequeña espera para que la BDD inicie primero
         logger.info("Esperando 5s a que inicie la BDD...")
         time.sleep(5)
         run_generator_loop(questions)

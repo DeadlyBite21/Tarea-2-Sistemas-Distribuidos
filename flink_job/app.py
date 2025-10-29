@@ -3,12 +3,11 @@ import re
 import json
 import logging
 from pyflink.datastream import StreamExecutionEnvironment
-# --- Importaciones ajustadas ---
 from pyflink.datastream.connectors.kafka import (
     KafkaSource,
     KafkaSink,
     KafkaOffsetsInitializer,
-    KafkaRecordSerializationSchema, # Usado en Sinks
+    KafkaRecordSerializationSchema,
 )
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.typeinfo import Types
@@ -16,10 +15,6 @@ from pyflink.common.watermark_strategy import WatermarkStrategy
 from pyflink.common import Duration
 from pyflink.common import Row
 
-
-# =================================================================
-# Configuración (Sin cambios)
-# =================================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("flink_job")
 
@@ -55,7 +50,6 @@ STOP_WORDS_EN = set([
     "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now", "?"
 ])
 
-# Frases genéricas/malas SOLO en inglés
 BAD_PHRASES_EN = [
     "i don't know", "search google", "good question", "try this link", 
     "check this out", "i guess", "maybe", "sorry"
@@ -90,9 +84,9 @@ def calculate_score(message: dict) -> float:
     if 50 <= len_ans <= 600: score_length = 1.0
     elif 20 <= len_ans < 50: score_length = 0.5
     elif len_ans > 600: score_length = 0.3
-    # Verificación de seguridad para answer vacío (aunque get("", "") lo previene)
+    # Verificación de seguridad para answer vacío
     elif len_ans == 0: score_length = 0.0
-    else: score_length = 0.1 # Muy corta (< 20)
+    else: score_length = 0.1
 
     # --- 2. Score de Palabras Clave ---
     if question and answer:
@@ -110,13 +104,12 @@ def calculate_score(message: dict) -> float:
             score_keywords = 0.1 
 
     # --- 3. Score de Formato Básico ---
-    # ¡CORREGIDO! Añadir chequeo 'if answer:' para evitar IndexError en answer[0]
     if answer: 
         if answer[0].isupper() and answer[-1] in ".!?": score_format = 1.0
         elif answer[0].isupper() or answer[-1] in ".!?": score_format = 0.5
         else: score_format = 0.1
     else:
-        score_format = 0.0 # Sin respuesta, sin score de formato
+        score_format = 0.0
 
     # --- 4. Penalización por Frases Malas ---
     clean_a_lower = answer.lower() 
@@ -147,12 +140,10 @@ class Scorer(object):
     def __call__(self, json_string: str) -> dict:
         try:
             message = json.loads(json_string)
-            # Pasamos solo lo necesario a calculate_score
             score_input = {
                 "id": message.get("id"),
                 "question": message.get("question"),
                 "answer": message.get("answer"),
-                # Pasar original_message si tu score lo necesita
                 "original_message": message.get("original_message") 
             }
             score = calculate_score(score_input)
@@ -170,9 +161,8 @@ class PrepareForPersistence(object):
     Formatea el dict para guardarlo en la BDD y lo serializa a JSON string.
     """
     def __call__(self, message: dict) -> str:
-        # Filtra mensajes de error del paso anterior
         if "error" in message:
-            return json.dumps({}) # Devuelve JSON vacío para ignorar
+            return json.dumps({})
 
         output = {
             "id": message.get("id"),
@@ -189,7 +179,7 @@ class PrepareForRegeneration(object):
     def __call__(self, message: dict) -> str:
         # Filtra mensajes de error
         if "error" in message:
-             return json.dumps({}) # Ignorar
+             return json.dumps({})
 
         original_msg = message.get("original_message", {})
         
@@ -200,14 +190,9 @@ class PrepareForRegeneration(object):
         logger.warning(f"Regenerando (ID: {message.get('id')}, Score: {message.get('score'):.2f}, Intento: {regens})")
         return json.dumps(original_msg, ensure_ascii=False)
 
-# =================================================================
-# Job Principal de PyFlink (Simplificado)
-# =================================================================
-
 def run_flink_job():
     env = StreamExecutionEnvironment.get_execution_environment()
     
-    # --- CAMBIO 1: Source lee JSON como String ---
     kafka_source = KafkaSource.builder() \
         .set_bootstrap_servers(BOOTSTRAP_SERVERS) \
         .set_topics(TOPIC_INPUT) \
@@ -216,17 +201,12 @@ def run_flink_job():
         .set_value_only_deserializer(SimpleStringSchema()) \
         .build()
 
-    # --- CAMBIO 2: Watermark simple ---
     wm_strategy = WatermarkStrategy.no_watermarks()
 
-    # --- CAMBIO 3: Stream inicial es de Strings ---
     stream = env.from_source(kafka_source, wm_strategy, "Kafka Source")
 
-    # --- CAMBIO 4: Parsear y puntuar ---
-    # El output_type ahora es un diccionario genérico
     scored_stream = stream.map(Scorer(), output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY()))
 
-    # 5. Dividir el Stream (Routing - Opera sobre dicts)
     high_score_stream = scored_stream.filter(lambda msg: "error" not in msg and msg.get("score", 0.0) >= SCORE_THRESHOLD)
     low_score_stream = scored_stream.filter(
         lambda msg: "error" not in msg and \
@@ -234,11 +214,9 @@ def run_flink_job():
                     msg.get("original_message", {}).get("regens", 0) < MAX_REGENERATIONS
     )
 
-    # 6. Formatear los streams de salida (Devuelven JSON Strings)
     persistence_stream = high_score_stream.map(PrepareForPersistence(), output_type=Types.STRING())
     feedback_stream = low_score_stream.map(PrepareForRegeneration(), output_type=Types.STRING())
 
-    # 7. Definir los Sinks (Usan SimpleStringSchema)
     sink_persist = KafkaSink.builder() \
         .set_bootstrap_servers(BOOTSTRAP_SERVERS) \
         .set_record_serializer(
@@ -254,17 +232,14 @@ def run_flink_job():
         .set_record_serializer(
             KafkaRecordSerializationSchema.builder()
                 .set_topic(TOPIC_OUTPUT_REGENERATE)
-                .set_value_serialization_schema(SimpleStringSchema()) # Envía string
+                .set_value_serialization_schema(SimpleStringSchema())
                 .build()
         ) \
         .build()
 
-    # 8. Conectar streams a sinks
-    # Filtramos los JSON vacíos resultantes de errores de parseo/score
     persistence_stream.filter(lambda s: s != '{}').sink_to(sink_persist).name("Sink to BDD")
     feedback_stream.filter(lambda s: s != '{}').sink_to(sink_feedback).name("Sink to Regenerate")
 
-    # 9. Ejecutar
     env.execute("Flink Scoring and Feedback Job")
 
 if __name__ == "__main__":

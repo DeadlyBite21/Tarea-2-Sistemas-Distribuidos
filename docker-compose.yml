@@ -14,7 +14,7 @@ services:
   flink-jobmanager:
     build:
       context: ./flink_job
-    user: flink # Ejecuta como flink
+    user: flink 
     volumes:
       - ./flink_job:/opt/flink/job
     command: |
@@ -35,7 +35,6 @@ services:
       - TOPIC_INPUT=questions.answers
       - TOPIC_OUTPUT_VALIDATED=questions.validated
       - TOPIC_OUTPUT_REGENERATE=questions.llm
-      # Eliminamos FLINK_PROPERTIES si limpiaste el Dockerfile (copiando el JAR a lib)
     ports: ["8081:8081"]
     depends_on:
     - kafka
@@ -44,13 +43,12 @@ services:
   flink-taskmanager:
     build:
       context: ./flink_job
-    user: flink # Ejecuta como flink
+    user: flink 
     volumes:
       - ./flink_job:/opt/flink/job
-    command: taskmanager # TaskManager recogerá el PYTHONPATH automáticamente
+    command: taskmanager 
     environment:
       - JOB_MANAGER_RPC_ADDRESS=flink-jobmanager
-      # Eliminamos FLINK_PROPERTIES si limpiaste el Dockerfile
     depends_on: [flink-jobmanager]
 
   generator:
@@ -104,7 +102,6 @@ services:
       - "9000:9000"
     environment:
       KAFKA_BROKERCONNECT: "kafka:9092"
-      #JVM_OPTS: "-Xms32M -Xmx256M -Xss180K -XX:-TieredCompilation -XX:+UseStringDeduplication -noverify"
     depends_on:
       - kafka
 

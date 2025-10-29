@@ -4,7 +4,7 @@ Repositorio completo de tarea 2 de sistemas distribuidos.
 
 ## Características técnicas
 
-- **Orquestación:** Docker Compose para levantar todos los servicios.
+- **Creación:** Docker Compose para levantar todos los servicios.
 - **Mensajería:** Redpanda (Kafka API compatible) como broker de mensajes.
 - **Procesamiento de datos:** Apache Flink (JobManager y TaskManager) ejecutando un job en Python (`app.py`).
 - **Persistencia:** Servicio BDD con SQLite para almacenamiento.
